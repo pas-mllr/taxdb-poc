@@ -1,0 +1,348 @@
+name: TaxDB-POC CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+# Environment variables used across the pipeline
+env:
+  PYTHON_VERSION: '3.12.11'
+  POETRY_VERSION: '1.8.2'
+  LOCAL_MODE: 'true'
+  # Use LocalMiniLM embedding strategy for tests to avoid hitting paid endpoints
+  EMBEDDING_STRATEGY: 'local_minilm'
+  # Ensure tests complete in under 15 minutes
+  MAX_PARALLEL_TESTS: 4
+  # Avoid hitting paid endpoints
+  MOCK_EXTERNAL_SERVICES: 'true'
+  # Set PostgreSQL connection string for tests
+  PG_CONNSTR: 'postgresql://postgres:postgres@localhost:5432/taxdb_test'
+
+jobs:
+  # Job 1: Linting and code quality checks
+  lint:
+    name: Linting and Code Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # Ensure this job completes quickly
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install Poetry
+        run: |
+          pip install poetry==${{ env.POETRY_VERSION }}
+          poetry config virtualenvs.create false
+      
+      - name: Install dependencies
+        run: |
+          poetry install --no-interaction --no-root
+      
+      - name: Run flake8
+        run: |
+          pip install flake8
+          flake8 src tests --count --select=E9,F63,F7,F82 --show-source --statistics
+      
+      - name: Run black (check only)
+        run: |
+          pip install black
+          black --check src tests
+      
+      - name: Run isort (check only)
+        run: |
+          pip install isort
+          isort --check-only --profile black src tests
+      
+      - name: Run mypy
+        run: |
+          pip install mypy
+          mypy src
+      
+      - name: Check for security vulnerabilities
+        run: |
+          pip install bandit
+          bandit -r src -x tests
+
+  # Job 2: Unit tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # Ensure this job completes quickly
+    needs: lint # Run after linting passes
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install Poetry
+        run: |
+          pip install poetry==${{ env.POETRY_VERSION }}
+          poetry config virtualenvs.create false
+      
+      - name: Install dependencies
+        run: |
+          poetry install --no-interaction --no-root
+      
+      - name: Run unit tests
+        run: |
+          pytest -m "unit" --cov=src --cov-report=xml --cov-report=term-missing
+      
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: unit-tests
+          fail_ci_if_error: false
+
+  # Job 3: Integration tests with mocked external services
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # Ensure this job completes quickly
+    needs: lint # Run after linting passes
+    
+    services:
+      # PostgreSQL service with pgvector extension
+      postgres:
+        image: ankane/pgvector:latest
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: taxdb_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install Poetry
+        run: |
+          pip install poetry==${{ env.POETRY_VERSION }}
+          poetry config virtualenvs.create false
+      
+      - name: Install dependencies
+        run: |
+          poetry install --no-interaction --no-root
+      
+      - name: Initialize database
+        run: |
+          # Install psycopg2 for database initialization
+          pip install psycopg2-binary
+          
+          # Create pgvector extension
+          python -c "import psycopg2; conn = psycopg2.connect('${{ env.PG_CONNSTR }}'); cursor = conn.cursor(); cursor.execute('CREATE EXTENSION IF NOT EXISTS vector;'); conn.commit(); conn.close();"
+      
+      - name: Run integration tests
+        run: |
+          pytest -m "integration" --cov=src --cov-report=xml --cov-report=term-missing
+      
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: integration-tests
+          fail_ci_if_error: false
+
+  # Job 4: End-to-end tests using Docker Compose
+  e2e-tests:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # Allow more time for E2E tests
+    needs: [unit-tests, integration-tests] # Run after unit and integration tests pass
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install Poetry
+        run: |
+          pip install poetry==${{ env.POETRY_VERSION }}
+          poetry config virtualenvs.create false
+      
+      - name: Install dependencies
+        run: |
+          poetry install --no-interaction --no-root
+      
+      - name: Start Docker Compose services
+        run: |
+          docker compose -f docker/docker-compose.yml up -d
+          # Wait for services to be ready
+          sleep 10
+      
+      - name: Run E2E tests
+        run: |
+          # Set environment variables for tests
+          export LOCAL_MODE=true
+          export EMBEDDING_STRATEGY=local_minilm
+          export DOC_LOOKBACK_HOURS=48
+          
+          # Run E2E tests
+          pytest -m "e2e" --cov=src --cov-report=xml --cov-report=term-missing
+      
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: e2e-tests
+          fail_ci_if_error: false
+      
+      - name: Stop Docker Compose services
+        run: |
+          docker compose -f docker/docker-compose.yml down
+        if: always() # Ensure cleanup happens even if tests fail
+
+  # Job 5: Infrastructure validation for Bicep templates
+  infra-validation:
+    name: Infrastructure Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # Ensure this job completes quickly
+    needs: lint # Run after linting passes
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+      
+      - name: Install Bicep
+        run: |
+          az bicep install
+      
+      - name: Validate Bicep templates
+        run: |
+          # Validate main Bicep template
+          az bicep build --file infra/main.bicep
+          
+          # Check for linting issues
+          az bicep lint --file infra/main.bicep
+      
+      - name: Run cost guard check
+        run: |
+          # Install cost analysis tool
+          pip install azure-mgmt-costmanagement azure-identity
+          
+          # Run cost check script
+          bash scripts/cost_check.sh
+
+  # Job 6: Combine coverage reports
+  coverage:
+    name: Code Coverage Report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # Ensure this job completes quickly
+    needs: [unit-tests, integration-tests, e2e-tests] # Run after all tests complete
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install coverage tools
+        run: |
+          pip install coverage codecov
+      
+      - name: Download coverage reports
+        uses: actions/download-artifact@v3
+        with:
+          path: coverage-reports
+      
+      - name: Combine coverage reports
+        run: |
+          coverage combine coverage-reports/*/coverage.xml
+          coverage report
+          coverage xml
+      
+      - name: Upload combined coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: all-tests
+          fail_ci_if_error: false
+      
+      - name: Generate coverage badge
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          flags: all-tests
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Job 7: Notify on completion
+  notify:
+    name: Notification
+    runs-on: ubuntu-latest
+    timeout-minutes: 1 # Quick notification job
+    needs: [unit-tests, integration-tests, e2e-tests, infra-validation, coverage]
+    if: always() # Run even if previous jobs fail
+    
+    steps:
+      - name: Check job status
+        id: check
+        run: |
+          if [[ "${{ needs.unit-tests.result }}" == "success" && \
+                "${{ needs.integration-tests.result }}" == "success" && \
+                "${{ needs.e2e-tests.result }}" == "success" && \
+                "${{ needs.infra-validation.result }}" == "success" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Notify on success
+        if: steps.check.outputs.status == 'success'
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: ci-notifications
+          SLACK_COLOR: good
+          SLACK_TITLE: CI Pipeline Succeeded
+          SLACK_MESSAGE: 'TaxDB-POC CI pipeline completed successfully! :rocket:'
+      
+      - name: Notify on failure
+        if: steps.check.outputs.status == 'failure'
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_CHANNEL: ci-notifications
+          SLACK_COLOR: danger
+          SLACK_TITLE: CI Pipeline Failed
+          SLACK_MESSAGE: 'TaxDB-POC CI pipeline failed! :x: Please check the logs.'

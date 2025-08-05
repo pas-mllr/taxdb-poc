@@ -1,0 +1,56 @@
+services:
+  db:
+    image: ankane/pgvector:0.5.1
+    container_name: taxdb-postgres
+    environment:
+      POSTGRES_USER: taxdb
+      POSTGRES_PASSWORD: taxdb
+      POSTGRES_DB: taxdb
+    ports: ["5432:5432"]
+    volumes:
+      - "./pgvector-init.sql:/docker-entrypoint-initdb.d/pgvector.sql:ro"
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - taxdb-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taxdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.29.0
+    container_name: taxdb-azurite
+    command: "azurite-blob --blobHost 0.0.0.0 -l /data"
+    ports: ["10000:10000"]
+    volumes:
+      - azurite-data:/data
+    networks:
+      - taxdb-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:10000/devstoreaccount1?comp=list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+networks:
+  taxdb-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  azurite-data:
