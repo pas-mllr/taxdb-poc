@@ -176,72 +176,67 @@ async def fetch_boe_documents(
     while current_date <= end_date:
         date_str = current_date.strftime("%Y%m%d")
         
-        # There are different sections in BOE (A, B, C)
-        # Section A: Laws, royal decrees, etc.
-        # Section B: Other dispositions
-        # Section C: Appointments, competitions, etc.
-        for section in ["A", "B"]:  # Focus on sections A and B for tax documents
-            try:
-                # Construct URL for the XML summary
-                url = f"https://www.boe.es/diario_boe/xml.php?id=BOE-S-{date_str}"
-                
-                logger.info(f"Fetching Spanish BOE for {current_date} section {section}")
-                
-                # Download XML summary
-                content = await download_file(
-                    url, 
-                    cache_manager=cache_manager,
-                    jurisdiction="ES",
-                    headers={"Accept": "application/xml"}
-                )
-                
-                # Parse XML and extract document URLs
-                doc_urls = await extract_document_urls(content, section)
-                
-                # Process each document URL
-                for doc_url in doc_urls:
-                    try:
-                        # Download document XML
-                        doc_content = await download_file(
-                            doc_url, 
-                            cache_manager=cache_manager,
-                            jurisdiction="ES",
-                            headers={"Accept": "application/xml"}
+        try:
+            # Construct URL for the XML summary using new API
+            url = f"https://www.boe.es/datosabiertos/api/boe/sumario/{date_str}"
+            
+            logger.info(f"Fetching Spanish BOE for {current_date}")
+            
+            # Download XML summary
+            content = await download_file(
+                url,
+                cache_manager=cache_manager,
+                jurisdiction="ES",
+                headers={"Accept": "application/xml"}
+            )
+            
+            # Parse XML and extract document URLs
+            doc_urls = await extract_document_urls(content)
+            
+            # Process each document URL
+            for doc_url in doc_urls:
+                try:
+                    # Download document XML
+                    doc_content = await download_file(
+                        doc_url,
+                        cache_manager=cache_manager,
+                        jurisdiction="ES",
+                        headers={"Accept": "application/xml"}
+                    )
+                    
+                    # Parse document XML
+                    doc_data = await parse_boe_xml(doc_content, current_date)
+                    
+                    # Filter for tax-related documents
+                    tax_docs = [
+                        doc for doc in doc_data
+                        if is_tax_related(
+                            doc.get("text", "") + doc.get("title", ""),
+                            doc.get("category"),
+                            doc.get("ministry")
                         )
-                        
-                        # Parse document XML
-                        doc_data = await parse_boe_xml(doc_content, current_date)
-                        
-                        # Filter for tax-related documents
-                        tax_docs = [
-                            doc for doc in doc_data 
-                            if is_tax_related(
-                                doc.get("text", "") + doc.get("title", ""),
-                                doc.get("category"),
-                                doc.get("ministry")
-                            )
-                        ]
-                        
-                        # Add to documents list
-                        documents.extend(tax_docs)
-                        
-                        logger.info(
-                            f"Processed BOE document {doc_url}: "
-                            f"found {len(doc_data)} documents, {len(tax_docs)} tax-related"
-                        )
-                    except DownloadError as e:
-                        logger.warning(f"Download error for BOE document {doc_url}: {e}")
-                    except ParsingError as e:
-                        logger.error(f"Parsing error for BOE document {doc_url}: {e}")
-                    except Exception as e:
-                        logger.exception(f"Unexpected error processing BOE document {doc_url}: {e}")
-                
-            except DownloadError as e:
-                logger.warning(f"Download error for Spanish BOE {current_date} section {section}: {e}")
-            except ParsingError as e:
-                logger.error(f"Parsing error for Spanish BOE {current_date} section {section}: {e}")
-            except Exception as e:
-                logger.exception(f"Unexpected error processing Spanish BOE for {current_date} section {section}: {e}")
+                    ]
+                    
+                    # Add to documents list
+                    documents.extend(tax_docs)
+                    
+                    logger.info(
+                        f"Processed BOE document {doc_url}: "
+                        f"found {len(doc_data)} documents, {len(tax_docs)} tax-related"
+                    )
+                except DownloadError as e:
+                    logger.warning(f"Download error for BOE document {doc_url}: {e}")
+                except ParsingError as e:
+                    logger.error(f"Parsing error for BOE document {doc_url}: {e}")
+                except Exception as e:
+                    logger.exception(f"Unexpected error processing BOE document {doc_url}: {e}")
+            
+        except DownloadError as e:
+            logger.warning(f"Download error for Spanish BOE {current_date}: {e}")
+        except ParsingError as e:
+            logger.error(f"Parsing error for Spanish BOE {current_date}: {e}")
+        except Exception as e:
+            logger.exception(f"Unexpected error processing Spanish BOE for {current_date}: {e}")
         
         # Move to next date
         current_date += timedelta(days=1)
@@ -249,12 +244,11 @@ async def fetch_boe_documents(
     return documents
 
 
-async def extract_document_urls(content: bytes, section: str) -> List[str]:
+async def extract_document_urls(content: bytes) -> List[str]:
     """Extract document URLs from BOE summary XML.
     
     Args:
-        content: XML content as bytes
-        section: BOE section (A, B, C)
+        content: XML content as bytes from new API
         
     Returns:
         List of document URLs
@@ -265,27 +259,25 @@ async def extract_document_urls(content: bytes, section: str) -> List[str]:
     urls: List[str] = []
     
     try:
-        # Register namespaces for proper XML parsing
-        for prefix, uri in NAMESPACES.items():
-            ET.register_namespace(prefix, uri)
-        
         # Parse XML
         root = ET.fromstring(content)
         
-        # Find all document elements for the specified section
-        # Try with and without namespace
-        doc_elems = root.findall(f".//boe:seccion[@id='{section}']/boe:departamento/boe:item", NAMESPACES)
-        if not doc_elems:
-            doc_elems = root.findall(f".//seccion[@id='{section}']/departamento/item", {})
+        # Check API response status
+        status_elem = root.find(".//status/code")
+        if status_elem is not None and status_elem.text != "200":
+            error_text = root.find(".//status/text")
+            error_msg = error_text.text if error_text is not None else "Unknown error"
+            raise ParsingError(f"API error: {error_msg}")
+        
+        # Find all document items in the new structure
+        # New structure: response/data/sumario/diario/seccion/departamento/epigrafe/item
+        doc_elems = root.findall(".//item")
         
         for item in doc_elems:
-            # Extract document ID
-            id_elem = item.find(".//boe:id", NAMESPACES) or item.find(".//id", {})
-            if id_elem is not None and id_elem.text:
-                doc_id = id_elem.text
-                # Construct document URL
-                url = f"https://www.boe.es/diario_boe/xml.php?id={doc_id}"
-                urls.append(url)
+            # Extract URL from url_xml element
+            url_elem = item.find("url_xml")
+            if url_elem is not None and url_elem.text:
+                urls.append(url_elem.text)
         
         return urls
     except Exception as e:
@@ -322,9 +314,8 @@ async def parse_boe_xml(
         # Parse XML
         root = ET.fromstring(content)
         
-        # Extract document metadata
-        doc_id_elem = root.find(".//boe:documento/boe:metadatos/boe:identificador", NAMESPACES) or \
-                      root.find(".//documento/metadatos/identificador", {})
+        # Extract document metadata - updated for new XML structure
+        doc_id_elem = root.find(".//identificador")
         
         if doc_id_elem is None or not doc_id_elem.text:
             logger.warning(f"No document ID found in XML for {issue_date}")
@@ -333,13 +324,11 @@ async def parse_boe_xml(
         doc_id = f"ES:{doc_id_elem.text}"
         
         # Extract title
-        title_elem = root.find(".//boe:documento/boe:metadatos/boe:titulo", NAMESPACES) or \
-                     root.find(".//documento/metadatos/titulo", {})
+        title_elem = root.find(".//titulo")
         title = title_elem.text if title_elem is not None and title_elem.text else "Untitled"
         
         # Extract publication date
-        pub_date_elem = root.find(".//boe:documento/boe:metadatos/boe:fecha_publicacion", NAMESPACES) or \
-                        root.find(".//documento/metadatos/fecha_publicacion", {})
+        pub_date_elem = root.find(".//fecha_publicacion")
         pub_date = None
         
         if pub_date_elem is not None and pub_date_elem.text:
@@ -352,28 +341,35 @@ async def parse_boe_xml(
         doc_date = pub_date or issue_date
         
         # Extract department/ministry
-        ministry_elem = root.find(".//boe:documento/boe:metadatos/boe:departamento", NAMESPACES) or \
-                        root.find(".//documento/metadatos/departamento", {})
+        ministry_elem = root.find(".//departamento")
         ministry = ministry_elem.text if ministry_elem is not None and ministry_elem.text else None
         
-        # Extract category/subject
-        category_elem = root.find(".//boe:documento/boe:metadatos/boe:materia", NAMESPACES) or \
-                        root.find(".//documento/metadatos/materia", {})
+        # Extract category/subject (try multiple possible fields)
+        category_elem = root.find(".//materia") or root.find(".//rango")
         category = category_elem.text if category_elem is not None and category_elem.text else None
         
         # Extract text content
-        text_elem = root.find(".//boe:documento/boe:texto", NAMESPACES) or \
-                    root.find(".//documento/texto", {})
-        text = text_elem.text if text_elem is not None and text_elem.text else ""
+        text_elem = root.find(".//texto")
+        if text_elem is not None:
+            # Handle both text content and child elements
+            text_parts = []
+            if text_elem.text:
+                text_parts.append(text_elem.text)
+            for child in text_elem:
+                if child.text:
+                    text_parts.append(child.text)
+                if child.tail:
+                    text_parts.append(child.tail)
+            text = " ".join(text_parts)
+        else:
+            text = ""
         
-        # Extract summary
-        summary_elem = root.find(".//boe:documento/boe:metadatos/boe:resumen", NAMESPACES) or \
-                       root.find(".//documento/metadatos/resumen", {})
+        # Extract summary (may not exist in all documents)
+        summary_elem = root.find(".//resumen")
         summary = summary_elem.text if summary_elem is not None and summary_elem.text else None
         
         # Extract effective date
-        effective_date_elem = root.find(".//boe:documento/boe:metadatos/boe:fecha_vigencia", NAMESPACES) or \
-                              root.find(".//documento/metadatos/fecha_vigencia", {})
+        effective_date_elem = root.find(".//fecha_vigencia")
         effective_date = None
         
         if effective_date_elem is not None and effective_date_elem.text:
@@ -382,9 +378,8 @@ async def parse_boe_xml(
             except ValueError:
                 logger.warning(f"Invalid effective date format: {effective_date_elem.text}")
         
-        # Extract document type
-        doc_type_elem = root.find(".//boe:documento/boe:metadatos/boe:tipo_disposicion", NAMESPACES) or \
-                        root.find(".//documento/metadatos/tipo_disposicion", {})
+        # Extract document type from rango
+        doc_type_elem = root.find(".//rango")
         doc_type = doc_type_elem.text if doc_type_elem is not None and doc_type_elem.text else "legal"
         
         # Preprocess text for better embedding
@@ -392,6 +387,17 @@ async def parse_boe_xml(
         
         # Calculate checksum
         checksum = calculate_checksum(f"{doc_id}:{title}:{doc_date}:{processed_text}".encode())
+        
+        # Extract PDF URL from metadata
+        pdf_url_elem = root.find(".//url_pdf")
+        if pdf_url_elem is not None and pdf_url_elem.text:
+            if pdf_url_elem.text.startswith('/'):
+                blob_url = f"https://www.boe.es{pdf_url_elem.text}"
+            else:
+                blob_url = pdf_url_elem.text
+        else:
+            # Fallback to old format if no url_pdf found
+            blob_url = f"https://www.boe.es/boe/dias/{doc_date.strftime('%Y/%m/%d')}/pdfs/{doc_id_elem.text}.pdf"
         
         # Create document dictionary
         document = {
@@ -404,7 +410,7 @@ async def parse_boe_xml(
             "issue_date": doc_date,
             "effective_date": effective_date,
             "language_orig": "es",
-            "blob_url": f"https://www.boe.es/boe/dias/{doc_date.strftime('%Y/%m/%d')}/pdfs/{doc_id_elem.text}.pdf",
+            "blob_url": blob_url,
             "checksum": checksum,
             "text": processed_text,
             "category": category,
