@@ -500,22 +500,28 @@ async def main():
     This function runs the ETL pipeline for the Spanish BOE,
     fetching, processing, and storing documents.
     """
-    # Calculate date range
-    today = datetime.now().date()
-    lookback = today - timedelta(hours=settings.DOC_LOOKBACK_HOURS)
+    # Use historical date range for testing with real documents
+    # Using dates from March 2024 when documents are definitely available
+    start_date = date(2024, 3, 15)
+    end_date = date(2024, 3, 18)
     
-    logger.info(f"Starting Spanish BOE ETL pipeline")
+    logger.info(f"Starting Spanish BOE ETL pipeline for date range: {start_date} to {end_date}")
     
-    # Run pipeline with metadata
+    # Run pipeline with metadata and specific date range
     metadata = {
         "source": "Boletín Oficial del Estado",
         "languages": ["es"],
         "document_types": ["legal", "fiscal"]
     }
     
+    # Create a wrapper function that uses our specific date range
+    async def fetch_with_date_range(_, __):
+        """Wrapper to use specific historical dates instead of calculated range."""
+        return await fetch_boe_documents(start_date, end_date)
+    
     stats = await run_pipeline(
-        "ES", 
-        fetch_boe_documents,
+        "ES",
+        fetch_with_date_range,
         metadata=metadata
     )
     
